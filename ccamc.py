@@ -181,16 +181,10 @@ def _hash_file_sha256(path: str) -> Tuple[int, str]:
 
 def _compute_init_blob_hash() -> int:
     """Create and hash the initial position blob (starting position, no moves)."""
-    board = chess.Board()
-    zobrist = chess.polyglot.zobrist_hash(board)
-    
-    # Create the initial blob: parent=0, zobrist=starting position, 0 moves
+    # Create the initial blob: parent=0, no moves, result=*
     blob = bytearray(64)
     struct.pack_into('<Q', blob, 0, 0)           # parent_hash = 0
-    struct.pack_into('<Q', blob, 8, zobrist)     # zobrist_hash
-    blob[16] = 0                                  # move_count = 0
-    blob[17] = 0                                  # flags = 0
-    struct.pack_into('<H', blob, 62, 3)          # result = 3 (*=in progress)
+    struct.pack_into('<H', blob, 0x3E, 3)        # result = 3 (*=in progress)
     
     # Hash the blob
     h = hashlib.blake2b(bytes(blob), digest_size=8).digest()
@@ -206,13 +200,10 @@ INIT_BLOB_HASH = _compute_init_blob_hash()
 
 @dataclass
 class MoveBlob:
-    """A 64-byte block containing up to 22 chess moves."""
+    """A 64-byte block containing up to 27 chess moves."""
     
     parent_hash: int          # 8B: INIT_BLOB_HASH, ORPHAN_PARENT_HASH, or hash of previous blob
-    zobrist_hash: int         # 8B: Board state hash AFTER moves
-    move_count: int           # 1B: Number of moves (max 22)
-    flags: int                # 1B: b0=ECO anchor, b1=game end, b2-7=reserved
-    moves: List[int]          # Up to 22 packed moves (2B each)
+    moves: List[int]          # Up to 27 packed moves (2B each)
     result: int               # 2B: 0=1-0, 1=0-1, 2=1/2, 3=*
     
     def serialize(self) -> bytes:
@@ -222,20 +213,11 @@ class MoveBlob:
         # ParentHash (8B)
         struct.pack_into('<Q', data, 0x00, self.parent_hash)
         
-        # ZobristHash (8B)
-        struct.pack_into('<Q', data, 0x08, self.zobrist_hash)
+        # MoveData (54B = 27 moves × 2B)
+        for i, move_packed in enumerate(self.moves[:27]):
+            struct.pack_into('<H', data, 0x08 + i * 2, move_packed & 0xFFFF)
         
-        # MoveCount (1B)
-        data[0x10] = self.move_count & 0xFF
-        
-        # Flags (1B)
-        data[0x11] = self.flags & 0xFF
-        
-        # MoveData (44B = 22 moves × 2B)
-        for i, move_packed in enumerate(self.moves[:22]):
-            struct.pack_into('<H', data, 0x12 + i * 2, move_packed & 0xFFFF)
-        
-        # Meta/Result (2B)
+        # Result (2B)
         struct.pack_into('<H', data, 0x3E, self.result & 0xFFFF)
         
         return bytes(data)
@@ -247,18 +229,18 @@ class MoveBlob:
             raise ValueError("Blob must be exactly 64 bytes")
         
         parent_hash = struct.unpack_from('<Q', data, 0x00)[0]
-        zobrist_hash = struct.unpack_from('<Q', data, 0x08)[0]
-        move_count = data[0x10]
-        flags = data[0x11]
         
+        # Read all 27 move slots and stop at first 0x0000 (invalid move)
         moves = []
-        for i in range(move_count):
-            move_packed = struct.unpack_from('<H', data, 0x12 + i * 2)[0]
+        for i in range(27):
+            move_packed = struct.unpack_from('<H', data, 0x08 + i * 2)[0]
+            if move_packed == 0:  # 0x0000 = a1->a1 (invalid)
+                break
             moves.append(move_packed)
         
         result = struct.unpack_from('<H', data, 0x3E)[0]
         
-        return MoveBlob(parent_hash, zobrist_hash, move_count, flags, moves, result)
+        return MoveBlob(parent_hash, moves, result)
     
     def compute_hash(self) -> int:
         """Compute XXHash64 of this blob."""
@@ -742,13 +724,8 @@ class CCACMStore:
         # The initial blob should already be hashed to INIT_BLOB_HASH
         # We just need to make sure it exists in the store
         if INIT_BLOB_HASH not in self.packfile.blobs:
-            board = chess.Board()
-            zobrist = chess.polyglot.zobrist_hash(board)
             init_blob = MoveBlob(
                 parent_hash=0,
-                zobrist_hash=zobrist,
-                move_count=0,
-                flags=0,
                 moves=[],
                 result=3  # In progress
             )
@@ -879,19 +856,8 @@ class CCACMStore:
                 continue
             
             # Create new blob
-            board = chess.Board()
-            for move_packed in eco_packed[:move_idx + chunk_size]:
-                move = decode_move_packed(move_packed, board)
-                if move:
-                    board.push(move)
-            
-            zobrist = chess.polyglot.zobrist_hash(board)
-            
             blob = MoveBlob(
                 parent_hash=current_parent,
-                zobrist_hash=zobrist,
-                move_count=len(chunk),
-                flags=0,
                 moves=chunk,
                 result=3  # Unknown result for ECO blobs
             )
@@ -937,15 +903,8 @@ class CCACMStore:
         for i in range(0, len(packed_moves), 22):
             chunk = packed_moves[i:i+22]
             
-            flags = 0
-            if i + len(chunk) == len(packed_moves):
-                flags |= 0x02  # Variation end
-            
             blob = MoveBlob(
                 parent_hash=parent_hash,
-                zobrist_hash=0,  # Not used for variations
-                move_count=len(chunk),
-                flags=flags,
                 moves=chunk,
                 result=3  # Unknown
             )
@@ -996,15 +955,8 @@ class CCACMStore:
         for i in range(0, len(packed_moves), 22):
             chunk = packed_moves[i:i+22]
             
-            flags = 0
-            if i + len(chunk) == len(packed_moves):
-                flags |= 0x02  # Variation end
-            
             blob = MoveBlob(
                 parent_hash=parent_hash,
-                zobrist_hash=0,
-                move_count=len(chunk),
-                flags=flags,
                 moves=chunk,
                 result=3
             )
@@ -1220,21 +1172,17 @@ class CCACMStore:
                 chunk_size = min(22, len(packed_moves) - move_idx)
                 chunk = packed_moves[move_idx:move_idx + chunk_size]
 
-                # Advance board incrementally and compute Zobrist after these moves
+                # Advance board incrementally
                 _apply_packed(board, chunk)
-                zobrist = chess.polyglot.zobrist_hash(board)
 
-                flags = 0
-                if move_idx + chunk_size == len(packed_moves):
-                    flags |= 0x02  # Game end
+                # Determine result for this blob
+                is_final = (move_idx + chunk_size == len(packed_moves))
+                blob_result = result if is_final else 3
 
                 blob = MoveBlob(
                     parent_hash=parent_hash,
-                    zobrist_hash=zobrist,
-                    move_count=len(chunk),
-                    flags=flags,
                     moves=chunk,
-                    result=result if flags & 0x02 else 3
+                    result=blob_result
                 )
 
                 blob_hash = self.packfile.add_blob(blob)
@@ -1426,7 +1374,7 @@ def main() -> None:
 
     # Prepare source descriptor
     size_bytes, sha256_hex = _hash_file_sha256(pgn_file)
-    imported_at = datetime.now(datetime.UTC).isoformat()
+    imported_at = datetime.utcnow().isoformat()
     source_label = os.path.basename(pgn_file)
     source_entry = SourceEntry(
         label=source_label,
