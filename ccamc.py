@@ -845,7 +845,7 @@ class CCACMStore:
         current_parent = parent_hash
         
         while move_idx < len(eco_packed):
-            chunk_size = min(22, len(eco_packed) - move_idx)
+            chunk_size = min(27, len(eco_packed) - move_idx)
             chunk = eco_packed[move_idx:move_idx + chunk_size]
             
             # Check if blob already exists
@@ -1125,16 +1125,25 @@ class CCACMStore:
                 if move:
                     board_obj.push(move)
         
-        # Find matching ECO lines and create/reuse their blob chains
+        # Find matching ECO lines and use only the longest match
         eco_matches = self._find_matching_eco_lines(packed_moves)
         parent_hash = INIT_BLOB_HASH
         move_idx = 0
         
-        # Create blob chains for matching ECO lines (hierarchical)
-        for eco_code, eco_name, eco_packed in eco_matches:
-            # Create/find ECO blob chain from current parent
-            parent_hash = self._create_eco_blob_chain(eco_packed, parent_hash)
-            move_idx = len(eco_packed)
+        # Use only the longest ECO match (if any)
+        if eco_matches:
+            eco_code, eco_name, eco_packed = eco_matches[-1]  # Last match is longest
+            eco_len = len(eco_packed)
+            game_len = len(packed_moves)
+            
+            # Calculate blobs needed with and without ECO parent
+            blobs_with_eco = (eco_len + 26) // 27 + (game_len - eco_len + 26) // 27
+            blobs_without_eco = (game_len + 26) // 27
+            
+            # Only use ECO parent if it saves blobs or breaks even
+            if blobs_with_eco <= blobs_without_eco:
+                parent_hash = self._create_eco_blob_chain(eco_packed, INIT_BLOB_HASH)
+                move_idx = eco_len
 
         # Align board to the state after ECO moves (once)
         board = game.board()
@@ -1150,7 +1159,7 @@ class CCACMStore:
             best_match_len = 0
             
             # Try different chunk sizes, largest first
-            for chunk_size in range(min(22, len(packed_moves) - move_idx), 0, -1):
+            for chunk_size in range(min(27, len(packed_moves) - move_idx), 0, -1):
                 chunk = packed_moves[move_idx:move_idx + chunk_size]
                 
                 # Look for existing blob with this parent and moves
@@ -1168,8 +1177,8 @@ class CCACMStore:
                 parent_hash = best_match_hash
                 move_idx += best_match_len
             else:
-                # No existing match, create new blob with remaining moves (up to 22)
-                chunk_size = min(22, len(packed_moves) - move_idx)
+                # No existing match, create new blob with remaining moves (up to 27)
+                chunk_size = min(27, len(packed_moves) - move_idx)
                 chunk = packed_moves[move_idx:move_idx + chunk_size]
 
                 # Advance board incrementally
